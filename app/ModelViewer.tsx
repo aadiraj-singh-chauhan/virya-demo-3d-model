@@ -331,7 +331,6 @@ function RobotScene({
                 }}
                 onMouseEnter={() => {
                   setHoveredId(hs.id);
-                  onHoverStart(hs.id);
                   document.body.style.cursor = 'pointer';
                 }}
                 onMouseLeave={() => {
@@ -482,6 +481,7 @@ function CameraSetup({
 // ─── Root component ───────────────────────────────────────────────────────────
 export default function ModelViewer() {
   const [activeFeature, setActiveFeature] = useState<string>('feature-1');
+  const [cameraFeature, setCameraFeature] = useState<string>('feature-1');
   const orbitRef = useRef<OrbitCtrl | null>(null);
   const isAnimatingRef = useRef(false);
 
@@ -558,13 +558,13 @@ export default function ModelViewer() {
       >
         <ambientLight intensity={0.65} />
         <directionalLight position={[5, 5, 5]} intensity={0.85} />
-        <CameraSetup orbitRef={orbitRef} activeFeature={activeFeature} isAnimatingRef={isAnimatingRef} />
+        <CameraSetup orbitRef={orbitRef} activeFeature={cameraFeature} isAnimatingRef={isAnimatingRef} />
         <Suspense fallback={null}>
           <RobotScene
             activeFeature={activeFeature}
-            onHoverStart={(id) => setActiveFeature(id)}
+            onHoverStart={() => {}}
             onHoverEnd={() => {}}
-            onClick={(id) => setActiveFeature(id)}
+            onClick={(id) => { setActiveFeature(id); setCameraFeature(id); }}
           />
           <Environment preset="studio" background={false} environmentIntensity={0.45} />
         </Suspense>
@@ -597,8 +597,8 @@ export default function ModelViewer() {
             <motion.div
               key={key}
               layout
-              onMouseEnter={() => setActiveFeature(key)}
-              onClick={() => setActiveFeature(key)}
+              onMouseEnter={() => { setActiveFeature(key); setCameraFeature(key); }}
+              onClick={() => { setActiveFeature(key); setCameraFeature(key); }}
               ref={(el) => { if (el && activeFeature === key) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
               animate={{
                 boxShadow: isActive
