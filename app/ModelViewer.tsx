@@ -1,6 +1,7 @@
 'use client';
 
-import { Suspense, useRef, useMemo, useEffect, useState } from 'react';
+import React, { Suspense, useRef, useMemo, useEffect, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { useGLTF, Environment, Html, OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
@@ -12,7 +13,7 @@ const HOTSPOT_POSITIONS = {
   'feature-1': [-0.01,  0.12,  0.30], // 2D Lidar
   'feature-2': [ 0.00,  0.44,  0.08], // 3D Lidar (top spinning dome)
   'feature-3': [ 0.30, -0.28,  0.38], // Wheelbase (front face of right wheel)
-  'feature-4': [-0.14, -0.20,  0.34], // new dot (left wheel — mirrors wheelbase)
+  'feature-4': [ 0.10,  0.06, -0.34], // AXIS-IMU — rear of model
 };
 
 // Flip to true to show red debug spheres at every hotspot position
@@ -22,7 +23,7 @@ const HOTSPOTS = [
   { id: 'feature-1', label: '2D LIDAR',  position: HOTSPOT_POSITIONS['feature-1'] as [number, number, number] },
   { id: 'feature-2', label: '3D LIDAR',  position: HOTSPOT_POSITIONS['feature-2'] as [number, number, number], fadePosition: HOTSPOT_POSITIONS['feature-1'] as [number, number, number] },
   { id: 'feature-3', label: 'WHEELBASE', position: HOTSPOT_POSITIONS['feature-3'] as [number, number, number], fadePosition: HOTSPOT_POSITIONS['feature-1'] as [number, number, number] },
-  { id: 'feature-4', label: 'AXIS-IMU',  position: HOTSPOT_POSITIONS['feature-4'] as [number, number, number], fadePosition: HOTSPOT_POSITIONS['feature-1'] as [number, number, number] },
+  { id: 'feature-4', label: 'AXIS-IMU',  position: HOTSPOT_POSITIONS['feature-4'] as [number, number, number], fadeRange: [-0.30, 0.48] as [number, number], fadeRangeRight: [0.20, 0.48] as [number, number] },
 ];
 
 // ─── Feature panel data ───────────────────────────────────────────────────────
@@ -92,13 +93,16 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
 //
 const VERTEX_SHADER = /* glsl */`
   attribute float instanceOpacity;
+  attribute float instanceRippleActive;
   varying  float vOpacity;
+  varying  float vRippleActive;
   varying  vec2  vUv;
   uniform  float size;
 
   void main() {
-    vUv      = uv;
-    vOpacity = instanceOpacity;
+    vUv           = uv;
+    vOpacity      = instanceOpacity;
+    vRippleActive = instanceRippleActive;
 
     // Full world position of this instance:
     vec4 worldPos = modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
@@ -121,6 +125,7 @@ const FRAGMENT_SHADER = /* glsl */`
   uniform float time;
   uniform vec3  hotspotColor;
   varying float vOpacity;
+  varying float vRippleActive;
   varying vec2  vUv;
 
   void main() {
@@ -130,8 +135,8 @@ const FRAGMENT_SHADER = /* glsl */`
     // Solid centre dot
     float centre = 1.0 - smoothstep(0.12, 0.20, dist);
 
-    // First expanding ripple ring
-    float speed = 1.1;
+    // First expanding ripple ring (slowed down from 1.1 to 0.6 for elegant motion)
+    float speed = 0.6;
     float p1    = fract(time * speed);
     float r1    = p1 * 0.88;
     float w     = 0.055;
@@ -146,7 +151,8 @@ const FRAGMENT_SHADER = /* glsl */`
                 * (1.0 - smoothstep(r2, r2 + w * 0.35, dist))
                 * pow(1.0 - p2, 2.0);
 
-    float alpha = centre + (ring1 + ring2) * 0.72;
+    // Ripple outer rings are active only for the hovered/selected hotspot
+    float alpha = centre + (ring1 + ring2) * 0.72 * vRippleActive;
     alpha      *= smoothstep(1.05, 0.88, dist); // hard clip at quad boundary
     alpha      *= vOpacity;                     // per-instance visibility fade
 
@@ -185,15 +191,18 @@ function RobotScene({
   // The opacities Float32Array is the *same* object referenced by the
   // InstancedBufferAttribute, so mutating opacities[i] each frame and then
   // setting needsUpdate = true is all that's required — no extra allocations.
-  const { geometry, material, opacities } = useMemo(() => {
+  const { geometry, material, opacities, rippleActives } = useMemo(() => {
     const geo      = new THREE.PlaneGeometry(1, 1);
     const ops      = new Float32Array(HOTSPOTS.length).fill(1.0);
     geo.setAttribute('instanceOpacity', new THREE.InstancedBufferAttribute(ops, 1));
 
+    const rips     = new Float32Array(HOTSPOTS.length).fill(0.0);
+    geo.setAttribute('instanceRippleActive', new THREE.InstancedBufferAttribute(rips, 1));
+
     const mat = new THREE.ShaderMaterial({
       uniforms: {
         time:         { value: 0 },
-        size:         { value: 0.10 },
+        size:         { value: 0.18 },
         hotspotColor: { value: new THREE.Color('#F43D00') },
       },
       vertexShader:   VERTEX_SHADER,
@@ -204,7 +213,7 @@ function RobotScene({
       side:           THREE.DoubleSide,
     });
 
-    return { geometry: geo, material: mat, opacities: ops };
+    return { geometry: geo, material: mat, opacities: ops, rippleActives: rips };
   }, []);
 
   // Centering the model geometry manually so it aligns exactly with static local coordinates
@@ -222,6 +231,12 @@ function RobotScene({
   // This mirrors the globe's single-pass setup: positions authored once, never
   // recalculated.
   useEffect(() => {
+    // Shift the whole group so the model sits lower and to the left in the viewport.
+    // Done imperatively so no JSX prop or linter can reset it.
+    if (groupRef.current) {
+      groupRef.current.position.set(-0.45, 0, 0);
+    }
+
     if (!meshRef.current) return;
     const dummy = new THREE.Object3D();
     HOTSPOTS.forEach((hs, i) => {
@@ -250,9 +265,21 @@ function RobotScene({
         .normalize();
 
       const dot  = _hotspotDir.current.dot(_camDir.current);
-      const fade = smoothstep(0.05, 0.22, dot);
+      const hsTyped = hs as typeof hs & { fadeRange?: [number, number]; fadeRangeRight?: [number, number] };
+      let [fe0, fe1] = hsTyped.fadeRange ?? [0.05, 0.22];
+      if (hsTyped.fadeRangeRight) {
+        const camRelX = camera.position.x - _groupPos.current.x;
+        const rightBias = Math.max(0, Math.min(1, camRelX / 0.4));
+        fe0 = fe0 * (1 - rightBias) + hsTyped.fadeRangeRight[0] * rightBias;
+        fe1 = fe1 * (1 - rightBias) + hsTyped.fadeRangeRight[1] * rightBias;
+      }
+      const fade = smoothstep(fe0, fe1, dot);
 
       opacities[i] = fade;
+      
+      // Only ripple if hovered or currently selected active feature card
+      const isRippleActive = (activeFeature === hs.id || hoveredId === hs.id);
+      rippleActives[i] = isRippleActive ? 1.0 : 0.0;
 
       const el = labelRefs.current[i];
       if (el) {
@@ -266,6 +293,8 @@ function RobotScene({
     });
 
     (meshRef.current.geometry.getAttribute('instanceOpacity') as THREE.BufferAttribute)
+      .needsUpdate = true;
+    (meshRef.current.geometry.getAttribute('instanceRippleActive') as THREE.BufferAttribute)
       .needsUpdate = true;
   });
 
@@ -293,10 +322,10 @@ function RobotScene({
                 ref={(el) => { hitRefs.current[i] = el; }}
                 style={{
                   position:      'absolute',
-                  width:         '18px',
-                  height:        '18px',
-                  left:          '-9px',
-                  top:           '-9px',
+                  width:         '30px',
+                  height:        '30px',
+                  left:          '-15px',
+                  top:           '-15px',
                   cursor:        'pointer',
                   pointerEvents: 'none',
                 }}
@@ -370,9 +399,91 @@ function RobotScene({
   );
 }
 
+// OrbitControls type definition and interactive camera setup
+type OrbitCtrl = { enableDamping: boolean; target: THREE.Vector3; object: { position: THREE.Vector3 }; update: () => void };
+function CameraSetup({
+  orbitRef,
+  activeFeature,
+  isAnimatingRef,
+}: {
+  orbitRef: React.MutableRefObject<OrbitCtrl | null>;
+  activeFeature: string;
+  isAnimatingRef: React.MutableRefObject<boolean>;
+}) {
+  const done = useRef(false);
+  const targetPos = useRef(new THREE.Vector3());
+  const animHorizontalDistance = useRef(0);
+
+  // Trigger camera rotation to face the selected hotspot
+  useEffect(() => {
+    if (!done.current || !orbitRef.current) return;
+
+    const hs = HOTSPOTS.find((h) => h.id === activeFeature);
+    if (!hs) return;
+
+    const ctrl = orbitRef.current;
+    
+    // Project direction onto XZ plane to match horizontal orbit constraint
+    const dir = new THREE.Vector3(hs.position[0], 0, hs.position[2]).normalize();
+    
+    // Calculate current horizontal distance to target to keep zoom/distance unchanged
+    const dx = ctrl.object.position.x - ctrl.target.x;
+    const dz = ctrl.object.position.z - ctrl.target.z;
+    animHorizontalDistance.current = Math.sqrt(dx * dx + dz * dz);
+    
+    // Set target position keeping Y and horizontal distance the same (prevents zoom or height shifts)
+    targetPos.current.set(
+      ctrl.target.x + dir.x * animHorizontalDistance.current,
+      ctrl.object.position.y,
+      ctrl.target.z + dir.z * animHorizontalDistance.current
+    );
+    isAnimatingRef.current = true;
+  }, [activeFeature, orbitRef, isAnimatingRef]);
+
+  useFrame(() => {
+    if (!orbitRef.current) return;
+    const ctrl = orbitRef.current;
+
+    if (!done.current) {
+      done.current = true;
+      ctrl.enableDamping = false;
+      ctrl.target.set(-0.45, 0, 0);
+      ctrl.object.position.set(-0.45, 0, 3);
+      ctrl.update();
+      ctrl.enableDamping = true;
+      return;
+    }
+
+    if (isAnimatingRef.current) {
+      // 1. Lerp the camera position directly
+      ctrl.object.position.lerp(targetPos.current, 0.08);
+      
+      // 2. Project back onto the cylinder to prevent zoom/shrink chord effect
+      const dx = ctrl.object.position.x - ctrl.target.x;
+      const dz = ctrl.object.position.z - ctrl.target.z;
+      const currentHorizontalDist = Math.sqrt(dx * dx + dz * dz);
+      
+      if (currentHorizontalDist > 0.0001 && animHorizontalDistance.current > 0) {
+        ctrl.object.position.x = ctrl.target.x + (dx / currentHorizontalDist) * animHorizontalDistance.current;
+        ctrl.object.position.z = ctrl.target.z + (dz / currentHorizontalDist) * animHorizontalDistance.current;
+      }
+      
+      ctrl.update();
+
+      if (ctrl.object.position.distanceTo(targetPos.current) < 0.005) {
+        isAnimatingRef.current = false;
+      }
+    }
+  });
+
+  return null;
+}
+
 // ─── Root component ───────────────────────────────────────────────────────────
 export default function ModelViewer() {
   const [activeFeature, setActiveFeature] = useState<string>('feature-1');
+  const orbitRef = useRef<OrbitCtrl | null>(null);
+  const isAnimatingRef = useRef(false);
 
   return (
     <div style={{
@@ -430,19 +541,24 @@ export default function ModelViewer() {
         </p>
       </div>
 
-      {/* Three.js canvas — constrained to the left side, panel occupies the right */}
+      {/* Full-viewport canvas — panel overlays on the right */}
       <Canvas
-        camera={{ position: [0, 0, 3], fov: 45 }}
+        camera={{ position: [0, 0.55, 2.8], fov: 32 }}
+        onPointerDown={() => {
+          isAnimatingRef.current = false;
+        }}
         style={{
           touchAction: 'none',
           position: 'absolute',
           left: 0,
-          width: 'calc(100vw - 480px)',
-          height: '100vh',
+          top: '80px',
+          width: 'calc(100vw - 340px)',
+          height: 'calc(100vh - 80px)',
         }}
       >
         <ambientLight intensity={0.65} />
         <directionalLight position={[5, 5, 5]} intensity={0.85} />
+        <CameraSetup orbitRef={orbitRef} activeFeature={activeFeature} isAnimatingRef={isAnimatingRef} />
         <Suspense fallback={null}>
           <RobotScene
             activeFeature={activeFeature}
@@ -453,10 +569,11 @@ export default function ModelViewer() {
           <Environment preset="studio" background={false} environmentIntensity={0.45} />
         </Suspense>
         <OrbitControls
+          ref={orbitRef as React.Ref<unknown>}
           enablePan={false}
           enableZoom={false}
-          enableDamping
-          dampingFactor={0.05}
+          autoRotate
+          autoRotateSpeed={0.6}
           minPolarAngle={Math.PI / 2}
           maxPolarAngle={Math.PI / 2}
         />
@@ -464,70 +581,95 @@ export default function ModelViewer() {
 
       {/* Feature cards panel */}
       <div style={{
-        position: 'absolute', top: '205px', right: '80px',
-        width: '370px', maxWidth: 'calc(100vw - 120px)',
-        maxHeight: 'calc(100vh - 240px)', overflowY: 'auto',
+        position: 'absolute', top: '200px', right: '48px',
+        width: '300px', maxWidth: 'calc(100vw - 80px)',
+        maxHeight: 'calc(100vh - 170px)', overflowY: 'auto',
+        scrollBehavior: 'smooth',
         zIndex: 1000,
-        display: 'flex', flexDirection: 'column', gap: '12px',
+        display: 'flex', flexDirection: 'column', gap: '8px',
         fontFamily: '"Outfit", "Inter", sans-serif',
       }}>
         {Object.keys(FEATURES).map((key) => {
-          const feat     = FEATURES[key];
+          const feat = FEATURES[key];
           const isActive = activeFeature === key;
 
-          if (isActive) {
-            return (
-              <div key={key} style={{
-                background: '#ffffff', border: '1px solid #e2e2e2',
-                overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.03)',
-                transition: 'all 0.3s ease, transform 0.3s ease',
-                display: 'flex', flexDirection: 'column',
-              }}>
-                <div style={{ width: '100%', height: '150px', overflow: 'hidden', background: '#f5f5f5' }}>
-                  <img src={feat.imageUrl} alt={feat.title}
-                    style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                </div>
-                <div style={{ padding: '24px', color: '#111111' }}>
-                  <h2 style={{
-                    fontSize: '16px', fontWeight: 700, margin: 0,
-                    letterSpacing: '1px', textTransform: 'uppercase',
-                    fontFamily: '"Outfit", sans-serif',
-                  }}>
-                    {feat.title}
-                  </h2>
-                  <p style={{
-                    fontSize: '13px', lineHeight: '1.6', color: '#666666',
-                    marginTop: '10px', marginBottom: 0,
-                    fontWeight: 400, fontFamily: '"Inter", sans-serif',
-                  }}>
-                    {feat.description}
-                  </p>
-                </div>
-              </div>
-            );
-          }
-
           return (
-            <div
+            <motion.div
               key={key}
-              onClick={() => setActiveFeature(key)}
+              layout
               onMouseEnter={() => setActiveFeature(key)}
-              style={{
-                background: '#ffffff', border: '1px solid #e2e2e2',
-                padding: '16px 24px', cursor: 'pointer',
-                display: 'flex', alignItems: 'center',
-                boxShadow: '0 2px 6px rgba(0,0,0,0.01)',
+              onClick={() => setActiveFeature(key)}
+              ref={(el) => { if (el && activeFeature === key) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
+              animate={{
+                boxShadow: isActive
+                  ? '0 8px 32px rgba(0,0,0,0.07)'
+                  : '0 2px 8px rgba(0,0,0,0.02)',
               }}
-              className="collapsed-tab"
+              transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+              style={{
+                background: '#ffffff',
+                border: '1px solid #e2e2e2',
+                borderRadius: '6px',
+                overflow: 'hidden',
+                cursor: 'pointer',
+              }}
             >
-              <span style={{
-                fontSize: '14px', fontWeight: 700,
-                letterSpacing: '1px', color: '#111111',
-                textTransform: 'uppercase',
-              }}>
-                {feat.title}
-              </span>
-            </div>
+              {/* Image — reveals downward */}
+              <AnimatePresence initial={false}>
+                {isActive && (
+                  <motion.div
+                    key="img"
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 160, opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+                    style={{ overflow: 'hidden', background: '#f0f0f0' }}
+                  >
+                    <motion.img
+                      src={feat.imageUrl}
+                      alt={feat.title}
+                      initial={{ scale: 1.06 }}
+                      animate={{ scale: 1 }}
+                      exit={{ scale: 1.06 }}
+                      transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+                      style={{ width: '100%', height: '160px', objectFit: 'cover', display: 'block' }}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Title — always visible */}
+              <div style={{ padding: '9px 14px' }}>
+                <h2 style={{
+                  fontSize: '13px', fontWeight: 700, margin: 0,
+                  letterSpacing: '1px', textTransform: 'uppercase',
+                  fontFamily: '"Outfit", sans-serif', color: '#111111',
+                }}>
+                  {feat.title}
+                </h2>
+
+                {/* Description — fades up after image settles */}
+                <AnimatePresence initial={false}>
+                  {isActive && (
+                    <motion.p
+                      key="desc"
+                      initial={{ opacity: 0, y: 8, height: 0, marginTop: 0 }}
+                      animate={{ opacity: 1, y: 0, height: 'auto', marginTop: '8px' }}
+                      exit={{ opacity: 0, y: 4, height: 0, marginTop: 0 }}
+                      transition={{ duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+                      style={{
+                        fontSize: '12px', lineHeight: '1.65', color: '#666666',
+                        marginBottom: 0, fontWeight: 400,
+                        fontFamily: '"Inter", sans-serif',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {feat.description}
+                    </motion.p>
+                  )}
+                </AnimatePresence>
+              </div>
+            </motion.div>
           );
         })}
       </div>
