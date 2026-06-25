@@ -94,10 +94,10 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
 const VERTEX_SHADER = /* glsl */`
   attribute float instanceOpacity;
   attribute float instanceRippleActive;
+  attribute float instanceSize;
   varying  float vOpacity;
   varying  float vRippleActive;
   varying  vec2  vUv;
-  uniform  float size;
 
   void main() {
     vUv           = uv;
@@ -110,7 +110,7 @@ const VERTEX_SHADER = /* glsl */`
     // Move to camera (view) space, then add the plane vertex as a screen-aligned
     // billboard offset — the quad always faces the camera with no JS rotation.
     vec4 viewPos  = viewMatrix * worldPos;
-    viewPos.xy   += position.xy * size;
+    viewPos.xy   += position.xy * instanceSize;
 
     // Pushes the quad slightly closer to the camera to prevent z-fighting with the underlying mesh
     viewPos.z    += 0.004;
@@ -165,11 +165,13 @@ const FRAGMENT_SHADER = /* glsl */`
 // ─── Robot scene: model + instanced hotspot layer ─────────────────────────────
 function RobotScene({
   activeFeature,
+  externalHoveredId,
   onHoverStart,
   onHoverEnd,
   onClick,
 }: {
   activeFeature: string;
+  externalHoveredId: string | null;
   onHoverStart: (id: string) => void;
   onHoverEnd:   () => void;
   onClick:      (id: string) => void;
@@ -187,11 +189,17 @@ function RobotScene({
   const _camDir     = useRef(new THREE.Vector3());
   const _hotspotDir = useRef(new THREE.Vector3());
 
+  // Lerp targets for per-dot size and dim factor — updated every frame toward target.
+  const _currentSizes = useRef(new Float32Array(HOTSPOTS.length).fill(0.18));
+  const _currentDims  = useRef(new Float32Array(HOTSPOTS.length).fill(1.0));
+
   // Geometry, material and the opacities buffer are all created exactly once.
   // The opacities Float32Array is the *same* object referenced by the
   // InstancedBufferAttribute, so mutating opacities[i] each frame and then
   // setting needsUpdate = true is all that's required — no extra allocations.
-  const { geometry, material, opacities, rippleActives } = useMemo(() => {
+  const BASE_DOT_SIZE = 0.18;
+
+  const { geometry, material, opacities, rippleActives, sizes } = useMemo(() => {
     const geo      = new THREE.PlaneGeometry(1, 1);
     const ops      = new Float32Array(HOTSPOTS.length).fill(1.0);
     geo.setAttribute('instanceOpacity', new THREE.InstancedBufferAttribute(ops, 1));
@@ -199,21 +207,23 @@ function RobotScene({
     const rips     = new Float32Array(HOTSPOTS.length).fill(0.0);
     geo.setAttribute('instanceRippleActive', new THREE.InstancedBufferAttribute(rips, 1));
 
+    const szs      = new Float32Array(HOTSPOTS.length).fill(0.18);
+    geo.setAttribute('instanceSize', new THREE.InstancedBufferAttribute(szs, 1));
+
     const mat = new THREE.ShaderMaterial({
       uniforms: {
         time:         { value: 0 },
-        size:         { value: 0.18 },
         hotspotColor: { value: new THREE.Color('#F43D00') },
       },
       vertexShader:   VERTEX_SHADER,
       fragmentShader: FRAGMENT_SHADER,
       transparent:    true,
-      depthTest:      false,  // temporarily disabled to debug occlusion
-      depthWrite:     false,  // transparent quads must not write depth
+      depthTest:      false,
+      depthWrite:     false,
       side:           THREE.DoubleSide,
     });
 
-    return { geometry: geo, material: mat, opacities: ops, rippleActives: rips };
+    return { geometry: geo, material: mat, opacities: ops, rippleActives: rips, sizes: szs };
   }, []);
 
   // Centering the model geometry manually so it aligns exactly with static local coordinates
@@ -275,10 +285,23 @@ function RobotScene({
       }
       const fade = smoothstep(fe0, fe1, dot);
 
-      opacities[i] = fade;
-      
-      // Only ripple if hovered or currently selected active feature card
-      const isRippleActive = (activeFeature === hs.id || hoveredId === hs.id);
+      const activeId     = hoveredId ?? externalHoveredId ?? activeFeature;
+      const isThisActive = hs.id === activeId;
+      const anyHovered   = hoveredId !== null || externalHoveredId !== null;
+
+      // Lerp size: active dot grows to 1.4×, others stay at 1×
+      const targetSize = isThisActive ? BASE_DOT_SIZE * 1.4 : BASE_DOT_SIZE;
+      _currentSizes.current[i] += (targetSize - _currentSizes.current[i]) * 0.1;
+      sizes[i] = _currentSizes.current[i];
+
+      // Lerp dim: inactive dots fade to 40% only while something is being hovered
+      const targetDim = (anyHovered && !isThisActive) ? 0.4 : 1.0;
+      _currentDims.current[i] += (targetDim - _currentDims.current[i]) * 0.1;
+      opacities[i] = fade * _currentDims.current[i];
+
+      // Ripple: direct dot hover takes full precedence; fall back to panel hover, then activeFeature
+      const rippleId = hoveredId ?? externalHoveredId ?? activeFeature;
+      const isRippleActive = hs.id === rippleId;
       rippleActives[i] = isRippleActive ? 1.0 : 0.0;
 
       const el = labelRefs.current[i];
@@ -295,6 +318,8 @@ function RobotScene({
     (meshRef.current.geometry.getAttribute('instanceOpacity') as THREE.BufferAttribute)
       .needsUpdate = true;
     (meshRef.current.geometry.getAttribute('instanceRippleActive') as THREE.BufferAttribute)
+      .needsUpdate = true;
+    (meshRef.current.geometry.getAttribute('instanceSize') as THREE.BufferAttribute)
       .needsUpdate = true;
   });
 
@@ -314,6 +339,7 @@ function RobotScene({
       {HOTSPOTS.map((hs, i) => {
         const isHovered = hoveredId === hs.id;
         const isActive = activeFeature === hs.id;
+        const isNameplateVisible = isHovered || externalHoveredId === hs.id;
         return (
           <Html key={hs.id} position={hs.position} center zIndexRange={[100, 0]}>
             <div style={{ position: 'relative' }}>
@@ -349,7 +375,7 @@ function RobotScene({
                   position:        'absolute',
                   left:            '22px',
                   top:             '0px',
-                  transform:       `translateY(-50%) translateX(${isHovered ? '0px' : '-8px'})`,
+                  transform:       `translateY(-50%) translateX(${isNameplateVisible ? '0px' : '-8px'})`,
                   backgroundColor: '#F43D00',
                   color:           '#FFFFFF',
                   height:          '38px',
@@ -363,8 +389,8 @@ function RobotScene({
                   letterSpacing:   '1.2px',
                   boxShadow:       '0 4px 12px rgba(244,61,0,0.2)',
                   pointerEvents:   'none',
-                  opacity:         isHovered ? 1 : 0,
-                  visibility:      isHovered ? 'visible' : 'hidden',
+                  opacity:         isNameplateVisible ? 1 : 0,
+                  visibility:      isNameplateVisible ? 'visible' : 'hidden',
                   transition:      'opacity 0.2s ease, transform 0.2s cubic-bezier(0.16,1,0.3,1), visibility 0.2s ease',
                 }}>
                   <span>{hs.label}</span>
@@ -482,6 +508,7 @@ function CameraSetup({
 export default function ModelViewer() {
   const [activeFeature, setActiveFeature] = useState<string>('feature-1');
   const [cameraFeature, setCameraFeature] = useState<string>('feature-1');
+  const [panelHoveredId, setPanelHoveredId] = useState<string | null>(null);
   const orbitRef = useRef<OrbitCtrl | null>(null);
   const isAnimatingRef = useRef(false);
 
@@ -562,6 +589,7 @@ export default function ModelViewer() {
         <Suspense fallback={null}>
           <RobotScene
             activeFeature={activeFeature}
+            externalHoveredId={panelHoveredId}
             onHoverStart={() => {}}
             onHoverEnd={() => {}}
             onClick={(id) => { setActiveFeature(id); setCameraFeature(id); }}
@@ -597,7 +625,8 @@ export default function ModelViewer() {
             <motion.div
               key={key}
               layout
-              onMouseEnter={() => { setActiveFeature(key); setCameraFeature(key); }}
+              onMouseEnter={() => { setActiveFeature(key); setCameraFeature(key); setPanelHoveredId(key); }}
+              onMouseLeave={() => setPanelHoveredId(null)}
               onClick={() => { setActiveFeature(key); setCameraFeature(key); }}
               ref={(el) => { if (el && activeFeature === key) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
               animate={{
