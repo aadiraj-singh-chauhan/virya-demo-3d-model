@@ -569,7 +569,7 @@ export default function ModelViewer() {
           <Environment preset="studio" background={false} environmentIntensity={0.45} />
         </Suspense>
         <OrbitControls
-          ref={orbitRef as React.Ref<unknown>}
+          ref={orbitRef as React.Ref<any>}
           enablePan={false}
           enableZoom={false}
           autoRotate
