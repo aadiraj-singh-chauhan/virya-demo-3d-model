@@ -339,7 +339,9 @@ function RobotScene({
       {HOTSPOTS.map((hs, i) => {
         const isHovered = hoveredId === hs.id;
         const isActive = activeFeature === hs.id;
-        const isNameplateVisible = isHovered || externalHoveredId === hs.id;
+        const isNameplateVisible = hoveredId !== null
+          ? isHovered
+          : (externalHoveredId === hs.id || isActive);
         return (
           <Html key={hs.id} position={hs.position} center zIndexRange={[100, 0]}>
             <div style={{ position: 'relative' }}>
@@ -515,7 +517,7 @@ export default function ModelViewer() {
   return (
     <div style={{
       width: '100vw', height: '100vh',
-      background: '#FAF7F2',
+      background: 'linear-gradient(180deg, rgba(33, 33, 33, 0.00) 0%, rgba(33, 33, 33, 0.20) 100%) #ffffff',
       touchAction: 'none',
       position: 'relative',
       overflow: 'hidden',
